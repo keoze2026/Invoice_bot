@@ -1,6 +1,7 @@
 import 'dotenv/config';
-import { Telegraf } from 'telegraf';
-import { CapitalistClient, CapitalistError } from './capitalist';
+import { randomBytes } from 'crypto';
+import { Context, Telegraf } from 'telegraf';
+import { CapitalistClient, CapitalistError, CapitalistOrder } from './capitalist';
 
 const {
   TELEGRAM_BOT_TOKEN,
@@ -30,7 +31,28 @@ if (!Number.isInteger(merchantId) || merchantId <= 0) {
   throw new Error('CAPITALIST_MERCHANT_ID must be a positive integer');
 }
 
-const currencyDisplay = CAPITALIST_CURRENCY_DISPLAY || CAPITALIST_CURRENCY;
+const currencies = CAPITALIST_CURRENCY.split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+if (currencies.length === 0) throw new Error('CAPITALIST_CURRENCY must list at least one code');
+
+const CURRENCY_LABELS: Record<string, string> = {
+  USDT: 'USDT (ERC-20)',
+  USDTt: 'USDT (TRC-20)',
+  USDTb: 'USDT (BEP-20)',
+  USDC: 'USDC (ERC-20)',
+  USDCb: 'USDC (BEP-20)',
+  BTC: 'Bitcoin',
+  ETH: 'Ethereum',
+  USD: 'USD',
+  EUR: 'EUR',
+  RUR: 'RUR',
+};
+
+function currencyLabel(code: string): string {
+  if (currencies.length === 1 && CAPITALIST_CURRENCY_DISPLAY) return CAPITALIST_CURRENCY_DISPLAY;
+  return CURRENCY_LABELS[code] ?? code;
+}
 
 const capitalist = new CapitalistClient(merchantId, CAPITALIST_MERCHANT_SECRET, CAPITALIST_API_URL);
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
@@ -38,10 +60,57 @@ const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 let isPaused = false;
 const isAdmin = (userId?: number) => !!userId && adminIds.has(userId);
 
+interface PendingIntent {
+  userId: number;
+  amount: number;
+  description: string;
+  displayDescription: string;
+  createdAt: number;
+}
+const pendingIntents = new Map<string, PendingIntent>();
+const INTENT_TTL_MS = 10 * 60 * 1000;
+
+function newIntent(
+  userId: number,
+  amount: number,
+  description: string,
+  displayDescription: string,
+): string {
+  const id = randomBytes(6).toString('hex');
+  pendingIntents.set(id, {
+    userId,
+    amount,
+    description,
+    displayDescription,
+    createdAt: Date.now(),
+  });
+  return id;
+}
+
+function takeIntent(id: string, userId: number): PendingIntent | null {
+  const intent = pendingIntents.get(id);
+  if (!intent) return null;
+  if (intent.userId !== userId) return null;
+  if (Date.now() - intent.createdAt > INTENT_TTL_MS) {
+    pendingIntents.delete(id);
+    return null;
+  }
+  pendingIntents.delete(id);
+  return intent;
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - INTENT_TTL_MS;
+  for (const [id, intent] of pendingIntents) {
+    if (intent.createdAt < cutoff) pendingIntents.delete(id);
+  }
+}, 60_000).unref();
+
+const methodsList = currencies.map(currencyLabel).join(', ');
 const WELCOME_MESSAGE = [
   `<b>Welcome${'${name}' /* placeholder, replaced per-user */}</b>`,
   '',
-  `I generate payment links in ${'${currency}'} no login required`,
+  `I generate payment links — no login required. Accepted methods: ${'${methods}'}.`,
   '',
   '<b>How to use</b>',
   '<code>/pay &lt;amount&gt; [description]</code>',
@@ -57,7 +126,7 @@ function renderWelcome(firstName?: string): string {
   const name = firstName ? `, ${escapeHtml(firstName)}` : '';
   return WELCOME_MESSAGE
     .replace('${name}', name)
-    .replace('${currency}', escapeHtml(currencyDisplay));
+    .replace('${methods}', escapeHtml(methodsList));
 }
 
 bot.start(async (ctx) => {
@@ -102,28 +171,98 @@ bot.command('pay', async (ctx) => {
     return;
   }
 
-  const description = descParts.join(' ').slice(0, 150) || CAPITALIST_DEFAULT_DESCRIPTION;
+  const userDescription = descParts.join(' ').slice(0, 150);
+  const apiDescription = userDescription || CAPITALIST_DEFAULT_DESCRIPTION;
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  if (currencies.length === 1) {
+    await createAndReply(ctx, currencies[0], amount, apiDescription, userDescription);
+    return;
+  }
+
+  const intentId = newIntent(userId, amount, apiDescription, userDescription);
+  await ctx.reply(
+    `Choose a payment method for <b>${formatAmountDisplay(amount)}</b>:`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: currencies.map((code) => [
+          { text: currencyLabel(code), callback_data: `p:${intentId}:${code}` },
+        ]),
+      },
+    },
+  );
+});
+
+bot.on('callback_query', async (ctx) => {
+  const data = (ctx.callbackQuery as { data?: string }).data;
+  if (!data || !data.startsWith('p:')) {
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  await ctx.answerCbQuery();
+
+  if (isPaused) {
+    await ctx.editMessageText('The bot is currently paused. Please try again later.');
+    return;
+  }
+
+  const [, intentId, currency] = data.split(':');
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  if (!currencies.includes(currency)) {
+    await ctx.editMessageText('That payment method is no longer available. Send /pay again.');
+    return;
+  }
+
+  const intent = takeIntent(intentId, userId);
+  if (!intent) {
+    await ctx.editMessageText('This payment request has expired. Send /pay again.');
+    return;
+  }
 
   try {
     const order = await capitalist.createOrder({
+      amount: intent.amount,
+      currency,
+      description: intent.description,
+      optClientId: String(userId),
+    });
+    await ctx.editMessageText(buildInvoiceMessage(order, currency, intent.displayDescription), {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (err) {
+    if (err instanceof CapitalistError) {
+      await ctx.editMessageText(`The payment provider rejected the invoice:\n${err.message}`);
+      return;
+    }
+    console.error('createOrder failed', err);
+    await ctx.editMessageText('Could not create the invoice. Please try again later.');
+  }
+});
+
+async function createAndReply(
+  ctx: Context,
+  currency: string,
+  amount: number,
+  description: string,
+  displayDescription: string,
+): Promise<void> {
+  try {
+    const order = await capitalist.createOrder({
       amount,
-      currency: CAPITALIST_CURRENCY,
+      currency,
       description,
       optClientId: String(ctx.from?.id ?? ''),
     });
-
-    const status = order.statusLocalized || order.status;
-    const message = [
-      '<b>New invoice!</b>',
-      '',
-      `<b>UUID:</b> ${escapeHtml(order.number)}`,
-      `<b>Status:</b> ${escapeHtml(status)}`,
-      `<b>Amount:</b> ${formatAmountDisplay(order.amount)} ${escapeHtml(currencyDisplay)}`,
-      `<b>Description:</b> ${escapeHtml(order.description)}`,
-      `<b>Payment Link:</b> <a href="${escapeHtml(order.paymentUrl)}">${escapeHtml(order.paymentUrl)}</a>`,
-    ].join('\n');
-
-    await ctx.reply(message, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
+    await ctx.reply(buildInvoiceMessage(order, currency, displayDescription), {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
   } catch (err) {
     if (err instanceof CapitalistError) {
       await ctx.reply(`The payment provider rejected the invoice:\n${err.message}`);
@@ -132,7 +271,24 @@ bot.command('pay', async (ctx) => {
     console.error('createOrder failed', err);
     await ctx.reply('Could not create the invoice. Please try again later.');
   }
-});
+}
+
+function buildInvoiceMessage(
+  order: CapitalistOrder,
+  currency: string,
+  displayDescription: string,
+): string {
+  const status = order.statusLocalized || order.status;
+  return [
+    '<b>New invoice!</b>',
+    '',
+    `<b>UUID:</b> ${escapeHtml(order.number)}`,
+    `<b>Status:</b> ${escapeHtml(status)}`,
+    `<b>Amount:</b> ${formatAmountDisplay(order.amount)} ${escapeHtml(currencyLabel(currency))}`,
+    `<b>Description:</b> ${escapeHtml(displayDescription)}`,
+    `<b>Payment Link:</b> <a href="${escapeHtml(order.paymentUrl)}">${escapeHtml(order.paymentUrl)}</a>`,
+  ].join('\n');
+}
 
 function escapeHtml(value: string): string {
   return value
