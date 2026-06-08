@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { randomBytes } from 'crypto';
+import { Agent } from 'https';
 import { Context, Telegraf } from 'telegraf';
 import { CapitalistClient, CapitalistError, CapitalistOrder } from './capitalist';
 
@@ -55,7 +56,11 @@ function currencyLabel(code: string): string {
 }
 
 const capitalist = new CapitalistClient(merchantId, CAPITALIST_MERCHANT_SECRET, CAPITALIST_API_URL);
-const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+
+// Reuse connections to the Telegram Bot API so we skip the TLS handshake on
+// every getUpdates/sendMessage/editMessageText call.
+const telegramAgent = new Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 64 });
+const bot = new Telegraf(TELEGRAM_BOT_TOKEN, { telegram: { agent: telegramAgent } });
 
 let isPaused = false;
 const isAdmin = (userId?: number) => !!userId && adminIds.has(userId);
@@ -202,7 +207,9 @@ bot.on('callback_query', async (ctx) => {
     return;
   }
 
-  await ctx.answerCbQuery();
+  // Dismiss the loading spinner without blocking — this round-trip runs
+  // concurrently with the order creation below instead of in front of it.
+  const ack = ctx.answerCbQuery().catch(() => {});
 
   if (isPaused) {
     await ctx.editMessageText('The bot is currently paused. Please try again later.');
@@ -235,6 +242,7 @@ bot.on('callback_query', async (ctx) => {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
     });
+    await ack;
   } catch (err) {
     if (err instanceof CapitalistError) {
       await ctx.editMessageText(`The payment provider rejected the invoice:\n${err.message}`);
@@ -317,7 +325,8 @@ bot.command('stop', async (ctx) => {
   await ctx.reply('Bot paused. Send /start to resume.');
 });
 
-bot.launch().then(() => console.log('Bot started'));
+bot.launch({ allowedUpdates: ['message', 'callback_query'] });
+console.log('Bot started');
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));

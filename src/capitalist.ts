@@ -1,5 +1,11 @@
 import axios, { AxiosInstance } from 'axios';
+import { Agent } from 'https';
 import { createHmac, randomBytes } from 'crypto';
+
+// Reuse TCP/TLS connections across requests so we don't pay a fresh handshake
+// (multiple round-trips) on every order. Node 19+ enables this on the global
+// agent already, but an explicit agent guarantees it regardless of runtime.
+const keepAliveAgent = new Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 64 });
 
 export interface CreateOrderInput {
   amount: number;
@@ -55,6 +61,7 @@ export class CapitalistClient {
       baseURL: baseUrl,
       headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
       timeout: 15_000,
+      httpsAgent: keepAliveAgent,
     });
   }
 
