@@ -1,6 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 import { Agent } from 'https';
-import { createHmac, randomBytes } from 'crypto';
+import { createHmac, randomInt } from 'crypto';
 
 // Reuse TCP/TLS connections across requests so we don't pay a fresh handshake
 // (multiple round-trips) on every order. Node 19+ enables this on the global
@@ -119,8 +119,8 @@ function formatAmount(amount: number): string {
 }
 
 function generateOrderNumber(): string {
-  // Format: tg-<epoch-seconds>-<8 hex chars>. Alphanumeric + hyphen, well under 42 chars.
+  // Format: tg-<epoch-seconds>-<8 random digits>. Digits + hyphen, well under 42 chars.
   const ts = Math.floor(Date.now() / 1000);
-  const rand = randomBytes(4).toString('hex');
+  const rand = randomInt(0, 100_000_000).toString().padStart(8, '0');
   return `tg-${ts}-${rand}`;
 }
