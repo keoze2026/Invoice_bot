@@ -62,6 +62,43 @@ const capitalist = new CapitalistClient(merchantId, CAPITALIST_MERCHANT_SECRET, 
 const telegramAgent = new Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 64 });
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN, { telegram: { agent: telegramAgent } });
 
+// ── Rate Limiting ────────────────────────────────────────────
+const RATE_LIMIT_MAX = 5;            // max requests allowed
+const RATE_LIMIT_WINDOW_MS = 60_000; // per 60 seconds window
+
+interface RateEntry {
+  count: number;
+  windowStart: number;
+}
+const rateLimitMap = new Map<number, RateEntry>();
+
+function isRateLimited(userId: number): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(userId);
+
+  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    // First request or window has expired — reset
+    rateLimitMap.set(userId, { count: 1, windowStart: now });
+    return false;
+  }
+
+  if (entry.count >= RATE_LIMIT_MAX) return true;
+
+  entry.count++;
+  return false;
+}
+
+// Clean up old entries every 5 minutes to prevent memory leaks
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, entry] of rateLimitMap) {
+    if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+      rateLimitMap.delete(id);
+    }
+  }
+}, 5 * 60_000).unref();
+// ── End Rate Limiting ────────────────────────────────────────
+
 let isPaused = false;
 const isAdmin = (userId?: number) => !!userId && adminIds.has(userId);
 
@@ -163,6 +200,19 @@ bot.command('pay', async (ctx) => {
     await ctx.reply('The bot is currently paused. Please try again later.');
     return;
   }
+
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  // ── Rate limit check ─────────────────────────────────────
+  if (isRateLimited(userId)) {
+    await ctx.reply(
+      '⚠️ You are sending too many requests.\nPlease wait a moment before trying again.',
+    );
+    return;
+  }
+  // ─────────────────────────────────────────────────────────
+
   const raw = ctx.message.text.replace(/^\/pay(@\w+)?\s*/i, '').trim();
   if (!raw) {
     await ctx.reply('Usage: /pay <amount> [description]\nExample: /pay 10');
@@ -178,8 +228,6 @@ bot.command('pay', async (ctx) => {
 
   const userDescription = descParts.join(' ').slice(0, 150);
   const apiDescription = userDescription || CAPITALIST_DEFAULT_DESCRIPTION;
-  const userId = ctx.from?.id;
-  if (!userId) return;
 
   if (currencies.length === 1) {
     await createAndReply(ctx, currencies[0], amount, apiDescription, userDescription);
