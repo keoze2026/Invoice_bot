@@ -63,7 +63,7 @@ const telegramAgent = new Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSo
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN, { telegram: { agent: telegramAgent } });
 
 // ── Rate Limiting ────────────────────────────────────────────
-const RATE_LIMIT_MAX = 5;            // max requests allowed
+const RATE_LIMIT_MAX = 20;            // max requests allowed
 const RATE_LIMIT_WINDOW_MS = 60_000; // per 60 seconds window
 
 interface RateEntry {
