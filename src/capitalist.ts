@@ -119,8 +119,8 @@ function formatAmount(amount: number): string {
 }
 
 function generateOrderNumber(): string {
-  // Format: tg-<epoch-seconds>-<8 random digits>. Digits + hyphen, well under 42 chars.
+  // Format: <epoch-seconds>-<8 random digits>. Digits + hyphen, well under 42 chars.
   const ts = Math.floor(Date.now() / 1000);
   const rand = randomInt(0, 100_000_000).toString().padStart(8, '0');
-  return `tg-${ts}-${rand}`;
+  return `${ts}-${rand}`;
 }
