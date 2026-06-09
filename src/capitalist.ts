@@ -1,6 +1,8 @@
 import axios, { AxiosInstance } from 'axios';
 import { Agent } from 'https';
-import { createHmac, randomInt } from 'crypto';
+import { createHmac } from 'crypto';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
 
 // Reuse TCP/TLS connections across requests so we don't pay a fresh handshake
 // (multiple round-trips) on every order. Node 19+ enables this on the global
@@ -118,9 +120,58 @@ function formatAmount(amount: number): string {
     .replace(/\.?0+$/, '');
 }
 
+// Daily-resetting sequential order numbers in the format YYMMDD-NNN (e.g. 260609-001).
+// The counter persists across restarts via a JSON file in the project root.
+const COUNTER_FILE = join(__dirname, '..', 'order-counter.json');
+
+interface CounterState {
+  date: string;
+  count: number;
+}
+
+let counterState: CounterState = loadCounter();
+
+function loadCounter(): CounterState {
+  if (!existsSync(COUNTER_FILE)) return { date: '', count: 0 };
+  try {
+    const parsed = JSON.parse(readFileSync(COUNTER_FILE, 'utf-8'));
+    if (typeof parsed?.date === 'string' && typeof parsed?.count === 'number') {
+      return { date: parsed.date, count: parsed.count };
+    }
+  } catch (err) {
+    console.warn('Could not read order counter, starting fresh:', err);
+  }
+  return { date: '', count: 0 };
+}
+
+function saveCounter(state: CounterState): void {
+  try {
+    writeFileSync(COUNTER_FILE, JSON.stringify(state));
+  } catch (err) {
+    console.warn('Could not persist order counter:', err);
+  }
+}
+
+// Day rolls over at midnight America/New_York (handles EST/EDT automatically).
+const DATE_FORMATTER = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  year: '2-digit',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+function todayYYMMDD(): string {
+  const parts = DATE_FORMATTER.formatToParts(new Date());
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? '';
+  return `${get('year')}${get('month')}${get('day')}`;
+}
+
 function generateOrderNumber(): string {
-  // Format: <epoch-seconds>-<8 random digits>. Digits + hyphen, well under 42 chars.
-  const ts = Math.floor(Date.now() / 1000);
-  const rand = randomInt(0, 100_000_000).toString().padStart(8, '0');
-  return `${ts}-${rand}`;
+  const today = todayYYMMDD();
+  if (counterState.date !== today) {
+    counterState = { date: today, count: 0 };
+  }
+  counterState.count += 1;
+  saveCounter(counterState);
+  return `${today}-${counterState.count.toString().padStart(3, '0')}`;
 }

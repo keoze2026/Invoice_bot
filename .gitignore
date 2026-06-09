@@ -5,3 +5,5 @@ dist/
 .DS_Store
 .claude
 MAINTAINING.md
+order-counter.json
+
